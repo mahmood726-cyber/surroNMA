@@ -5,21 +5,52 @@
 #' @name surroNMA
 NULL
 
+# ============================================================================
+# Constants
+# ============================================================================
+.EPSILON <- 1e-12       # Small value for numerical stability
+.LARGE_VAR <- 1e6       # Large variance for missing data
+.MIN_VAR <- 1e-9        # Minimum allowed variance
+.DEFAULT_SEED <- 1      # Default random seed
+.MIN_KFOLD <- 2         # Minimum k-fold CV value
+
+#' Check and load required packages
+#' @param pkgs Character vector of package names
+#' @param quietly Logical, suppress messages during loading
+#' @return TRUE if all packages available, FALSE otherwise
+#' @keywords internal
 .suro_require <- function(pkgs, quietly = TRUE) {
+  if (!is.character(pkgs) || length(pkgs) == 0) {
+    stop("pkgs must be a non-empty character vector")
+  }
+
   miss <- pkgs[!vapply(pkgs, requireNamespace, quietly = quietly, FUN.VALUE = logical(1))]
-  if (length(miss)) {
-    message("The following packages are suggested but not installed: ",
-            paste(miss, collapse = ", "),
-            "\nInstall them via install.packages(...) (or tools::pak()) as needed.")
+
+  if (length(miss) > 0) {
+    message(
+      "The following packages are suggested but not installed: ",
+      paste(miss, collapse = ", "),
+      "\nInstall them via install.packages(c('",
+      paste(miss, collapse = "', '"),
+      "')) or use pak::pak(c('",
+      paste(miss, collapse = "', '"),
+      "'))"
+    )
     return(invisible(FALSE))
   }
+
   invisible(TRUE)
 }
 
+#' Check if CmdStan is properly installed and available
+#' @return Logical indicating if CmdStan is available
+#' @keywords internal
 cmdstan_check <- function() {
-  if (!requireNamespace("cmdstanr", quietly = TRUE)) return(FALSE)
+  if (!requireNamespace("cmdstanr", quietly = TRUE)) {
+    return(FALSE)
+  }
   cs <- try(cmdstanr::cmdstan_version(), silent = TRUE)
-  isTRUE(!inherits(cs, "try-error"))
+  !inherits(cs, "try-error")
 }
 #' Help for CmdStan setup
 #' @export
@@ -31,28 +62,52 @@ cmdstanr::install_cmdstan()   # one-time, compilers required
 --------------------------------\n")
 }
 
-.invlogit <- function(x) 1/(1+exp(-x))
+#' Inverse logit (logistic) function
+#' @param x Numeric vector
+#' @return Transformed values in (0, 1)
+#' @keywords internal
+.invlogit <- function(x) {
+  1 / (1 + exp(-x))
+}
 
 .mvrnorm_chol <- function(n, mu, Sigma) {
+  # Input validation
+  if (!is.numeric(n) || length(n) != 1 || n < 1) {
+    stop("n must be a positive integer")
+  }
+  if (!is.numeric(mu)) {
+    stop("mu must be a numeric vector")
+  }
+  if (!is.matrix(Sigma) || nrow(Sigma) != ncol(Sigma)) {
+    stop("Sigma must be a square matrix")
+  }
+  if (nrow(Sigma) != length(mu)) {
+    stop("Dimensions of mu and Sigma are incompatible")
+  }
+
   if (!.suro_require("Matrix")) {
     ev <- eigen(Sigma, symmetric = TRUE)
-    ev$values[ev$values < 1e-12] <- 1e-12
+    ev$values[ev$values < .EPSILON] <- .EPSILON
     A <- ev$vectors %*% diag(sqrt(ev$values), nrow(Sigma)) %*% t(ev$vectors)
-    Z <- matrix(stats::rnorm(n*length(mu)), n) 
-    sweep(Z %*% t(A), 2, mu, `+`)
-  } else {
-    near <- try(Matrix::nearPD(Sigma, corr = FALSE), silent = TRUE)
-    S <- if (inherits(near, "try-error")) Sigma else as.matrix(near$mat)
-    z <- matrix(stats::rnorm(n*length(mu)), n)
-    R <- try(chol(S), silent=TRUE)
-    if (inherits(R, "try-error")) {
-      ev <- eigen(S, symmetric = TRUE)
-      ev$values[ev$values < 1e-12] <- 1e-12
-      A <- ev$vectors %*% diag(sqrt(ev$values), nrow(S)) %*% t(ev$vectors)
-      return( sweep(z %*% t(A), 2, mu, `+`) )
-    }
-    sweep(z %*% R, 2, mu, `+`)
+    Z <- matrix(stats::rnorm(n * length(mu)), n)
+    return(sweep(Z %*% t(A), 2, mu, `+`))
   }
+
+  # Use Matrix package for better numerical stability
+  near <- try(Matrix::nearPD(Sigma, corr = FALSE), silent = TRUE)
+  S <- if (inherits(near, "try-error")) Sigma else as.matrix(near$mat)
+  z <- matrix(stats::rnorm(n * length(mu)), n)
+  R <- try(chol(S), silent = TRUE)
+
+  if (inherits(R, "try-error")) {
+    # Fallback to eigendecomposition if Cholesky fails
+    ev <- eigen(S, symmetric = TRUE)
+    ev$values[ev$values < .EPSILON] <- .EPSILON
+    A <- ev$vectors %*% diag(sqrt(ev$values), nrow(S)) %*% t(ev$vectors)
+    return(sweep(z %*% t(A), 2, mu, `+`))
+  }
+
+  sweep(z %*% R, 2, mu, `+`)
 }
 
 # ---------------- Data constructor ----------------
@@ -180,13 +235,32 @@ surro_network <- function(
 #' @export
 surro_index_train <- function(net, method = c("ols","ridge","pcr","sl3"),
                               zscore = TRUE, seed = 1, sl3_learners = NULL, kfold = 5) {
+  # Input validation
+  if (!inherits(net, "list") || is.null(net$S_multi)) {
+    stop("net must be a valid surrogate network object with S_multi component")
+  }
+  if (!is.logical(zscore) || length(zscore) != 1) {
+    stop("zscore must be a single logical value (TRUE/FALSE)")
+  }
+  if (!is.numeric(seed) || length(seed) != 1) {
+    stop("seed must be a single numeric value")
+  }
+  if (!is.numeric(kfold) || length(kfold) != 1 || kfold < .MIN_KFOLD) {
+    stop(sprintf("kfold must be a numeric value >= %d", .MIN_KFOLD))
+  }
+
   method <- match.arg(method)
-  if (is.null(net$S_multi)) stop("S_multi required to train an SI.")
   S <- as.data.frame(net$S_multi)
   colnames(S) <- paste0("S", seq_len(ncol(S)))
   T <- net$T_eff
   ok <- which(is.finite(T) & rowSums(is.finite(S)) == ncol(S))
-  if (!length(ok)) stop("No complete cases for SI training.")
+  if (!length(ok)) {
+    stop("No complete cases for SI training. Check that both T_eff and S_multi have finite values.")
+  }
+  if (length(ok) < ncol(S) + 1) {
+    warning(sprintf("Only %d complete cases for %d surrogates. Consider reducing surrogates or gathering more data.",
+                    length(ok), ncol(S)))
+  }
   S <- S[ok, , drop=FALSE]
   T <- T[ok]
   if (zscore) {
@@ -219,8 +293,7 @@ surro_index_train <- function(net, method = c("ols","ridge","pcr","sl3"),
     yhat <- stats::predict(m, ncomp = vn, newdata = S)[,1,1]
     res$cv_r2 <- max(0, 1 - mean((T - yhat)^2, na.rm = TRUE)/stats::var(T, na.rm = TRUE))
   } else if (method == "sl3") {
-    .suro_require(c("sl3","data.table"))
-    library(sl3)
+    if (!.suro_require(c("sl3","data.table"))) stop("sl3 and data.table packages required for this method")
     task <- sl3::sl3_Task(data = data.table::as.data.table(cbind(S, T=T)), covariates = colnames(S), outcome = "T")
     if (is.null(sl3_learners)) {
       lrn <- Lrnr_glm_fast$new()
@@ -240,8 +313,19 @@ surro_index_train <- function(net, method = c("ols","ridge","pcr","sl3"),
 #' Apply a trained SI to augment the network
 #' @export
 augment_network_with_SI <- function(net, si_model) {
-  if (is.null(net$S_multi)) stop("S_multi required.")
+  # Input validation
+  if (!inherits(net, "list") || is.null(net$S_multi)) {
+    stop("net must be a valid surrogate network object with S_multi component")
+  }
+  if (!inherits(si_model, "surro_index")) {
+    stop("si_model must be a trained surrogate index object from surro_index_train()")
+  }
+
   S <- as.data.frame(net$S_multi)
+  if (ncol(S) != length(si_model$colnames)) {
+    stop(sprintf("Mismatch: network has %d surrogates but model was trained on %d",
+                 ncol(S), length(si_model$colnames)))
+  }
   colnames(S) <- si_model$colnames
   if (isTRUE(si_model$zscore)) {
     S <- as.data.frame(scale(S))
@@ -277,8 +361,19 @@ augment_network_with_SI <- function(net, si_model) {
 #' Compute Surrogate Threshold Effect (STE)
 #' @export
 compute_STE <- function(draws_alpha, draws_beta, threshold_T = 0.0) {
+  # Input validation
+  if (!is.numeric(draws_alpha) || !is.numeric(draws_beta)) {
+    stop("draws_alpha and draws_beta must be numeric vectors")
+  }
+  if (length(draws_alpha) != length(draws_beta)) {
+    stop("draws_alpha and draws_beta must have the same length")
+  }
+  if (any(is.na(draws_beta) | draws_beta == 0)) {
+    warning("Some draws_beta values are NA or zero, which will produce infinite STE values")
+  }
+
   ste <- (threshold_T - draws_alpha) / draws_beta
-  stats <- c(mean = mean(ste, na.rm=TRUE),
+  stats <- c(mean = mean(ste, na.rm = TRUE),
              median = stats::median(ste, na.rm=TRUE),
              q025 = stats::quantile(ste, 0.025, na.rm=TRUE),
              q975 = stats::quantile(ste, 0.975, na.rm=TRUE))
@@ -286,46 +381,106 @@ compute_STE <- function(draws_alpha, draws_beta, threshold_T = 0.0) {
 }
 
 # ---------------- Ranking helpers ----------------
+#' Calculate ranking matrix from effect size draws
+#' @param eff_matrix Matrix where each row is a draw and columns are treatments
+#' @return Matrix of ranks (higher effect = higher rank)
 #' @export
 rank_from_draws <- function(eff_matrix) {
+  if (!is.matrix(eff_matrix) && !is.data.frame(eff_matrix)) {
+    stop("eff_matrix must be a matrix or data frame")
+  }
+  if (nrow(eff_matrix) < 1 || ncol(eff_matrix) < 2) {
+    stop("eff_matrix must have at least 1 row and 2 columns")
+  }
   t(apply(eff_matrix, 1, function(x) rank(x, ties.method = "average")))
 }
+
+#' Calculate Surface Under the Cumulative Ranking curve (SUCRA)
+#' @param ranks Ranking matrix from rank_from_draws()
+#' @return Named vector of SUCRA values (0-1, higher is better)
 #' @export
 sucra <- function(ranks) {
+  if (!is.matrix(ranks) && !is.data.frame(ranks)) {
+    stop("ranks must be a matrix or data frame")
+  }
   K <- ncol(ranks)
+  if (K < 2) {
+    stop("ranks must have at least 2 columns")
+  }
   pr <- colMeans(ranks, na.rm = TRUE)
   (K - pr) / (K - 1)
 }
+
+#' Calculate Kendall's tau-based ranking consistency measure
+#' @param order1 First ordering vector
+#' @param order2 Second ordering vector
+#' @return Kendall distance (number of discordant pairs)
+#' @keywords internal
+.kendall_dist <- function(order1, order2) {
+  K <- length(order1)
+  o1 <- order(order1)
+  o2 <- order(order2)
+  d <- 0L
+  for (i in seq_len(K - 1)) {
+    for (j in (i + 1):K) {
+      d <- d + as.integer((o1[i] - o1[j]) * (o2[i] - o2[j]) < 0)
+    }
+  }
+  d
+}
+
+#' Calculate Probability of being in the Top Hierarchy (POTH)
+#' @param ranks Ranking matrix from rank_from_draws()
+#' @return Single value (0-1) measuring ranking consistency
 #' @export
 poth <- function(ranks) {
-  K <- ncol(ranks); N <- nrow(ranks)
-  modal_order <- order(colMeans(ranks, na.rm=TRUE))
-  kendall_dist <- function(order1, order2) {
-    K <- length(order1)
-    o1 <- order(order1); o2 <- order(order2)
-    d <- 0L
-    for (i in 1:(K-1)) for (j in (i+1):K) {
-      d <- d + as.integer( (o1[i]-o1[j])*(o2[i]-o2[j]) < 0 )
-    }
-    d
+  if (!is.matrix(ranks) && !is.data.frame(ranks)) {
+    stop("ranks must be a matrix or data frame")
   }
-  dmax <- K*(K-1)/2
-  dbar <- mean(apply(ranks, 1, function(r) kendall_dist(order(r), modal_order)))
-  1 - dbar/dmax
+  K <- ncol(ranks)
+  N <- nrow(ranks)
+  if (K < 2 || N < 1) {
+    stop("ranks must have at least 2 columns and 1 row")
+  }
+
+  modal_order <- order(colMeans(ranks, na.rm = TRUE))
+  dmax <- K * (K - 1) / 2
+  dbar <- mean(apply(ranks, 1, function(r) .kendall_dist(order(r), modal_order)))
+  1 - dbar / dmax
 }
+#' Calculate MID-adjusted preference ranking
+#' @param eff_matrix Matrix of effect sizes (rows = draws, cols = treatments)
+#' @param MID Minimal Important Difference threshold
+#' @return Matrix of MID-adjusted ranks
 #' @export
 mid_adjusted_preference <- function(eff_matrix, MID = 0) {
-  K <- ncol(eff_matrix)
-  ranks <- matrix(NA_real_, nrow(eff_matrix), K)
-  for (i in seq_len(nrow(eff_matrix))) {
-    x <- eff_matrix[i,]
-    wins <- rep(0, K)
-    for (a in 1:K) for (b in 1:K) if (a != b) {
-      d <- x[b] - x[a]
-      if (d > MID) wins[a] <- wins[a] + 1L
-    }
-    ranks[i,] <- rank(-wins, ties.method = "average")
+  if (!is.numeric(eff_matrix)) {
+    stop("eff_matrix must be numeric")
   }
+  if (!is.numeric(MID) || length(MID) != 1) {
+    stop("MID must be a single numeric value")
+  }
+
+  K <- ncol(eff_matrix)
+  N <- nrow(eff_matrix)
+  ranks <- matrix(NA_real_, N, K)
+
+  for (i in seq_len(N)) {
+    x <- eff_matrix[i, ]
+    wins <- integer(K)
+
+    # Count wins for each treatment
+    for (a in seq_len(K)) {
+      for (b in seq_len(K)) {
+        if (a != b && (x[b] - x[a]) > MID) {
+          wins[a] <- wins[a] + 1L
+        }
+      }
+    }
+
+    ranks[i, ] <- rank(-wins, ties.method = "average")
+  }
+
   ranks
 }
 
@@ -449,9 +604,9 @@ generated quantities{
     a = as.integer(net$trt),
     b = as.integer(net$comp),
     S_eff = ifelse(is.finite(net$S_eff), net$S_eff, 0),
-    S_se  = ifelse(is.finite(net$S_se),  pmax(net$S_se, 1e-9), 1e6),
+    S_se  = ifelse(is.finite(net$S_se),  pmax(net$S_se, .MIN_VAR), .LARGE_VAR),
     T_eff = ifelse(is.finite(net$T_eff), net$T_eff, 0),
-    T_se  = ifelse(is.finite(net$T_se),  pmax(net$T_se, 1e-9), 1e6),
+    T_se  = ifelse(is.finite(net$T_se),  pmax(net$T_se, .MIN_VAR), .LARGE_VAR),
     rho_ST = ifelse(is.finite(net$corr_ST), net$corr_ST, 0),
     has_T = hasT,
     G = net$G,
@@ -638,33 +793,88 @@ surro_nma <- function(net,
 }
 
 # ---------------- Summaries & prediction ----------------
+#' Extract treatment effect draws from fit object
+#' @param fit A surro_fit object from surro_nma()
+#' @return Matrix of draws (rows = iterations, cols = treatments)
 #' @export
 as_draws_T <- function(fit) {
-  if (fit$engine=="bayes") {
-    if (!requireNamespace("posterior", quietly = TRUE))
-      stop("posterior package required for Bayesian summaries")
-    dr <- fit$stan$draws(variables = paste0("dT[",1:fit$net$K,"]"))
-    posterior::as_draws_matrix(dr)
-  } else fit$draws_T
+  if (!inherits(fit, "surro_fit")) {
+    stop("fit must be a surro_fit object from surro_nma()")
+  }
+  if (!fit$engine %in% c("bayes", "freq")) {
+    stop("Unknown engine type: ", fit$engine)
+  }
+
+  if (fit$engine == "bayes") {
+    if (!requireNamespace("posterior", quietly = TRUE)) {
+      stop("posterior package required for Bayesian summaries. Install with: install.packages('posterior')")
+    }
+    dr <- fit$stan$draws(variables = paste0("dT[", seq_len(fit$net$K), "]"))
+    return(posterior::as_draws_matrix(dr))
+  }
+
+  # Frequentist engine
+  if (is.null(fit$draws_T)) {
+    stop("draws_T not found in frequentist fit object")
+  }
+  fit$draws_T
 }
+#' Summarize treatment effects with credible/confidence intervals
+#' @param fit A surro_fit object from surro_nma()
+#' @param probs Probability levels for quantiles (default: 95% CI)
+#' @return Data frame with treatment effect summaries
 #' @export
-summarize_treatments <- function(fit, probs = c(.025,.5,.975)) {
+summarize_treatments <- function(fit, probs = c(0.025, 0.5, 0.975)) {
+  if (!inherits(fit, "surro_fit")) {
+    stop("fit must be a surro_fit object from surro_nma()")
+  }
+  if (!is.numeric(probs) || any(probs < 0) || any(probs > 1)) {
+    stop("probs must be numeric values between 0 and 1")
+  }
+
   D <- as_draws_T(fit)
   trts <- fit$net$trt_levels
-  out <- t(apply(D, 2, function(x) c(mean=mean(x), stats::quantile(x, probs))))
-  colnames(out) <- c("mean", paste0(round(probs*100),"%"))
+
+  # Compute summaries more efficiently
+  out <- t(apply(D, 2, function(x) {
+    c(mean = mean(x, na.rm = TRUE), stats::quantile(x, probs, na.rm = TRUE))
+  }))
+
+  colnames(out) <- c("mean", paste0(round(probs * 100), "%"))
   rownames(out) <- trts
   as.data.frame(out)
 }
+#' Compute treatment rankings with SUCRA and POTH
+#' @param fit A surro_fit object from surro_nma()
+#' @param MID Optional Minimal Important Difference for MID-adjusted ranking
+#' @return List with ranks matrix, SUCRA values, and POTH measure
 #' @export
 compute_ranks <- function(fit, MID = NULL) {
+  if (!inherits(fit, "surro_fit")) {
+    stop("fit must be a surro_fit object from surro_nma()")
+  }
+
   D <- as_draws_T(fit)
-  if (!is.null(MID) && is.finite(MID)) {
-    ranks <- mid_adjusted_preference(D, MID = MID)
+
+  if (!is.null(MID)) {
+    if (!is.numeric(MID) || length(MID) != 1) {
+      stop("MID must be a single numeric value or NULL")
+    }
+    if (is.finite(MID)) {
+      ranks <- mid_adjusted_preference(D, MID = MID)
+    } else {
+      warning("MID is not finite, using standard ranking")
+      ranks <- rank_from_draws(D)
+    }
   } else {
     ranks <- rank_from_draws(D)
   }
-  list(ranks=ranks, sucra=sucra(ranks), poth=poth(ranks))
+
+  list(
+    ranks = ranks,
+    sucra = sucra(ranks),
+    poth = poth(ranks)
+  )
 }
 
 # ---------------- Diagnostics ----------------
@@ -761,36 +971,94 @@ global_inconsistency_test <- function(fit) {
 }
 
 # ---------------- Plotting ----------------
+#' Plot surrogacy relationship between S and T
+#' @param fit A surro_fit object from surro_nma()
+#' @return ggplot object
 #' @export
 plot_surrogacy <- function(fit) {
-  .suro_require("ggplot2")
+  .validate_fit(fit)
+
+  if (!.suro_require("ggplot2")) {
+    stop("ggplot2 package required for plotting. Install with: install.packages('ggplot2')")
+  }
+
   net <- fit$net
-  df <- data.frame(S=net$S_eff, T=net$T_eff, class=net$classes[net$trt_class_id[net$trt]])
-  df <- df[is.finite(df$S) & is.finite(df$T),]
-  ggplot2::ggplot(df, ggplot2::aes(S, T, color=class)) +
-    ggplot2::geom_point(alpha=.7) + ggplot2::geom_smooth(method="lm", se=TRUE) +
-    ggplot2::theme_minimal() + ggplot2::labs(title="Surrogacy scatter", x="Surrogate contrast", y="True contrast")
+  df <- data.frame(
+    S = net$S_eff,
+    T = net$T_eff,
+    class = net$classes[net$trt_class_id[net$trt]]
+  )
+
+  # Remove non-finite values
+  df <- df[is.finite(df$S) & is.finite(df$T), ]
+
+  if (nrow(df) == 0) {
+    stop("No finite S and T values to plot")
+  }
+
+  ggplot2::ggplot(df, ggplot2::aes(S, T, color = class)) +
+    ggplot2::geom_point(alpha = 0.7) +
+    ggplot2::geom_smooth(method = "lm", se = TRUE) +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title = "Surrogacy scatter",
+      x = "Surrogate contrast",
+      y = "True contrast"
+    )
 }
+#' Plot rankograms showing probability of each rank per treatment
+#' @param fit A surro_fit object from surro_nma()
+#' @return ggplot object
 #' @export
 plot_rankogram <- function(fit) {
-  .suro_require("ggplot2")
+  .validate_fit(fit)
+
+  if (!.suro_require("ggplot2")) {
+    stop("ggplot2 package required for plotting. Install with: install.packages('ggplot2')")
+  }
+
   D <- as_draws_T(fit)
   R <- rank_from_draws(D)
   K <- ncol(R)
-  P <- sapply(1:K, function(r) colMeans(R==r))
-  df <- data.frame(treatment = rep(fit$net$trt_levels, K),
-                   rank = rep(1:K, each=K),
-                   prob = as.vector(P))
-  ggplot2::ggplot(df, ggplot2::aes(x=factor(rank), y=prob, group=treatment))+
-    ggplot2::geom_line(alpha=.7)+ggplot2::geom_point()+
-    ggplot2::facet_wrap(~treatment)+ggplot2::theme_minimal()+
-    ggplot2::labs(title="Rankograms", x="Rank", y="Probability")
+
+  # Calculate rank probabilities more efficiently
+  P <- sapply(seq_len(K), function(r) colMeans(R == r))
+
+  df <- data.frame(
+    treatment = rep(fit$net$trt_levels, K),
+    rank = rep(seq_len(K), each = K),
+    prob = as.vector(P)
+  )
+
+  ggplot2::ggplot(df, ggplot2::aes(x = factor(rank), y = prob, group = treatment)) +
+    ggplot2::geom_line(alpha = 0.7) +
+    ggplot2::geom_point() +
+    ggplot2::facet_wrap(~treatment) +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(title = "Rankograms", x = "Rank", y = "Probability")
 }
+#' Plot network graph showing treatment comparisons
+#' @param net Network object from surro_network()
+#' @return igraph plot (invisible)
 #' @export
 plot_networks <- function(net) {
-  if (!.suro_require("igraph")) { message("igraph not installed; printing edge list."); print(table(paste(net$trt, net$comp))); return(invisible(NULL)) }
-  g <- igraph::graph_from_data_frame(data.frame(A=net$trt_levels[net$trt], B=net$trt_levels[net$comp]), directed = FALSE)
-  plot(g, main="Network graph")
+  .validate_network(net)
+
+  if (!.suro_require("igraph")) {
+    message("igraph not installed; printing edge list instead.")
+    edge_counts <- table(paste(net$trt, net$comp, sep = " vs "))
+    print(edge_counts)
+    return(invisible(NULL))
+  }
+
+  edges <- data.frame(
+    A = net$trt_levels[net$trt],
+    B = net$trt_levels[net$comp]
+  )
+
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE)
+  plot(g, main = "Network graph")
+  invisible(g)
 }
 #' @export
 plot_rank_flip <- function(fit) {
@@ -937,7 +1205,7 @@ print(plot_surrogacy(fit))
 plot_networks(fit$net)
 ```",
 
-if (True) 
+if (include_ppc)
 "## Posterior predictive check
 ```{r}
 if (fit$engine=='bayes') print(pp_check(fit))
@@ -981,7 +1249,6 @@ surroNMA_gui_gw <- function() {
     return(surroNMA_gui_tcltk())
   }
   options(guiToolkit = "RGtk2")
-  library(gWidgets2)
 
   w <- gwindow("surroNMA v1.0", visible = TRUE)
   nb <- gnotebook(container = w)
@@ -1133,10 +1400,51 @@ surroNMA_gui_tcltk <- function() {
   invisible(tt)
 }
 
-# small helpers
-`%+%` <- function(a,b) paste0(a,b)
+# ============================================================================
+# Utility helpers
+# ============================================================================
+
+#' String concatenation operator
+#' @keywords internal
+`%+%` <- function(a, b) paste0(a, b)
+
+#' Write Stan code to temporary file
+#' @param code Character string with Stan model code
+#' @return Path to temporary .stan file
+#' @keywords internal
 write_stan_file <- function(code) {
-  f <- tempfile(fileext = ".stan"); writeLines(code, f); f
+  if (!is.character(code) || length(code) == 0) {
+    stop("code must be a non-empty character string")
+  }
+  f <- tempfile(fileext = ".stan")
+  writeLines(code, f)
+  f
+}
+
+#' Validate fit object
+#' @keywords internal
+.validate_fit <- function(fit) {
+  if (!inherits(fit, "surro_fit")) {
+    stop("fit must be a surro_fit object from surro_nma()")
+  }
+  if (!fit$engine %in% c("bayes", "freq")) {
+    stop("Unknown engine type: ", fit$engine)
+  }
+  invisible(TRUE)
+}
+
+#' Validate network object
+#' @keywords internal
+.validate_network <- function(net) {
+  if (!inherits(net, "list")) {
+    stop("net must be a network object from surro_network()")
+  }
+  required <- c("K", "J", "trt", "comp", "study", "trt_levels")
+  missing <- setdiff(required, names(net))
+  if (length(missing) > 0) {
+    stop("Network object missing required components: ", paste(missing, collapse = ", "))
+  }
+  invisible(TRUE)
 }
 
 # ---------------- Survival/IPD & causal hooks ----------------
