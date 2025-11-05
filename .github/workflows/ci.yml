@@ -1,0 +1,75 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ main, develop, claude/* ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        r-version: ['4.2', '4.3', '4.4']
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up R ${{ matrix.r-version }}
+      uses: r-lib/actions/setup-r@v2
+      with:
+        r-version: ${{ matrix.r-version }}
+
+    - name: Install system dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+
+    - name: Install R dependencies
+      run: |
+        install.packages(c("remotes", "rcmdcheck", "covr"))
+        remotes::install_deps(dependencies = TRUE)
+      shell: Rscript {0}
+
+    - name: Check R package
+      run: rcmdcheck::rcmdcheck(args = "--no-manual", error_on = "error")
+      shell: Rscript {0}
+
+    - name: Test coverage
+      if: matrix.os == 'ubuntu-latest' && matrix.r-version == '4.4'
+      run: covr::codecov()
+      shell: Rscript {0}
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up R
+      uses: r-lib/actions/setup-r@v2
+
+    - name: Install lintr
+      run: install.packages("lintr")
+      shell: Rscript {0}
+
+    - name: Lint code
+      run: lintr::lint_package()
+      shell: Rscript {0}
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Build Docker image
+      run: docker build -t surronma:${{ github.sha }} .
+
+    - name: Test Docker image
+      run: |
+        docker run --rm surronma:${{ github.sha }} R -e "library(surroNMA); packageVersion('surroNMA')"

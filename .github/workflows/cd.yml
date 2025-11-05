@@ -1,0 +1,81 @@
+name: Continuous Deployment
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up R
+      uses: r-lib/actions/setup-r@v2
+
+    - name: Install dependencies
+      run: |
+        install.packages(c("devtools", "roxygen2", "pkgdown"))
+        remotes::install_deps(dependencies = TRUE)
+      shell: Rscript {0}
+
+    - name: Build package
+      run: devtools::build()
+      shell: Rscript {0}
+
+    - name: Generate documentation
+      run: |
+        roxygen2::roxygenise()
+        pkgdown::build_site()
+      shell: Rscript {0}
+
+    - name: Deploy documentation to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./docs
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Login to Docker Hub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Extract version from tag
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_USERNAME }}/surronma:${{ steps.get_version.outputs.VERSION }}
+          ${{ secrets.DOCKER_USERNAME }}/surronma:latest
+        cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/surronma:buildcache
+        cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/surronma:buildcache,mode=max
+
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./surroNMA_*.tar.gz
+        asset_name: surroNMA_${{ steps.get_version.outputs.VERSION }}.tar.gz
+        asset_content_type: application/gzip
