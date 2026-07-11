@@ -23,7 +23,7 @@ Affiliation: Tahir Heart Institute, Rabwah, Pakistan
 Links:
   Code:      https://github.com/mahmood726-cyber/surroNMA
   Protocol:  https://github.com/mahmood726-cyber/surroNMA/blob/main/E156-PROTOCOL.md
-  Dashboard: https://mahmood726-cyber.github.io/surronma/
+  Dashboard: https://mahmood726-cyber.github.io/surroNMA/
 
 References (topic pack: diagnostic meta-analysis (DTA)):
   1. Reitsma JB et al. 2005. Bivariate analysis of sensitivity and specificity produces informative summary measures in diagnostic reviews. J Clin Epidemiol. 58(10):982-990. doi:10.1016/j.jclinepi.2005.02.022

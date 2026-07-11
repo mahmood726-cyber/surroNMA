@@ -76,14 +76,14 @@ surro_network <- function(
   study_id <- df[[deparse(substitute(study))]]
   A <- df[[deparse(substitute(trt))]]
   B <- df[[deparse(substitute(comp))]]
-  Se <- if (!is.null(S_eff)) df[[deparse(substitute(S_eff))]] else NULL
-  Ss <- if (!is.null(S_se))  df[[deparse(substitute(S_se))]]  else NULL
-  Te <- if (!is.null(T_eff)) df[[deparse(substitute(T_eff))]] else NULL
-  Ts <- if (!is.null(T_se))  df[[deparse(substitute(T_se))]]  else NULL
-  Corr <- if (!is.null(corr_ST)) df[[deparse(substitute(corr_ST))]] else NULL
-  ClsRow <- if (!is.null(class)) df[[deparse(substitute(class))]] else NULL
-  BaseRisk <- if (!is.null(baseline_risk)) df[[deparse(substitute(baseline_risk))]] else NULL
-  RoB <- if (!is.null(rob)) df[[deparse(substitute(rob))]] else NULL
+  Se <- if (!is.null(substitute(S_eff))) df[[deparse(substitute(S_eff))]] else NULL
+  Ss <- if (!is.null(substitute(S_se)))  df[[deparse(substitute(S_se))]]  else NULL
+  Te <- if (!is.null(substitute(T_eff))) df[[deparse(substitute(T_eff))]] else NULL
+  Ts <- if (!is.null(substitute(T_se)))  df[[deparse(substitute(T_se))]]  else NULL
+  Corr <- if (!is.null(substitute(corr_ST))) df[[deparse(substitute(corr_ST))]] else NULL
+  ClsRow <- if (!is.null(substitute(class))) df[[deparse(substitute(class))]] else NULL
+  BaseRisk <- if (!is.null(substitute(baseline_risk))) df[[deparse(substitute(baseline_risk))]] else NULL
+  RoB <- if (!is.null(substitute(rob))) df[[deparse(substitute(rob))]] else NULL
 
   if (is.null(A) || is.null(B) || is.null(study_id))
     stop("study, trt, comp must be provided")
@@ -96,6 +96,8 @@ surro_network <- function(
 
   trts <- sort(unique(c(A, B)))
   K <- length(trts)
+  if (K < 2)
+    stop("surro_network requires >= 2 distinct treatments across trt/comp (got ", K, ").")
   map <- setNames(seq_len(K), trts)
   a <- as.integer(map[as.character(A)])
   b <- as.integer(map[as.character(B)])
@@ -375,7 +377,7 @@ if (inconsistency!="none") "real<lower=0> tauI_S; real<lower=0> tauI_T;" else ""
   vector[J] uS;
   vector[J] uT;
   ",
-if ('use_t') "real<lower=2> nu;" else "",
+if (use_t) "real<lower=2> nu;" else "",
 "
 }
 transformed parameters{
@@ -401,7 +403,7 @@ if (inconsistency!="none") "tauI_S ~ normal(0, prior_tauI_scale); tauI_T ~ norma
   uT ~ normal(0, tauT);
   for (i in 1:N){
     int j = study_id[i];
-    real muS = dS[a[i]] - dS[b[i]] + uS[j] ";
+    real muS = dS[a[i]] - dS[b[i]] + uS[j] ;",
 if (inconsistency!="none") {
   glue("
     if (", if (inc_on %in% c("S","both")) "1" else "0" , "==1) muS = muS + normal_rng(0, tauI_S);")
@@ -561,7 +563,7 @@ surro_nma_freq <- function(net, B = 400, boot = c("normal","student"), df = 5, s
   dT_hat <- c(0, as.numeric(betaT))
 
   sX  <- (X %*% betaS)
-  sY  <- ifelse(obsT, (XT %*% betaT), NA_real_)
+  sY  <- as.numeric(XT %*% betaT)   # length m = #(T-observed rows), aligned to idx below
   idx <- which(obsT)
   if (length(idx) < 3) warning("Few T-observed rows; frequentist surrogacy uncertain.")
   ratio <- mean(vT[is.finite(vT)], na.rm=TRUE) / mean(vS[is.finite(vS)], na.rm=TRUE)
@@ -576,6 +578,8 @@ surro_nma_freq <- function(net, B = 400, boot = c("normal","student"), df = 5, s
 
   B <- as.integer(B)
   draws_T <- matrix(NA_real_, B, K)
+  draws_alpha <- rep(NA_real_, B)   # bootstrap Deming intercept draws (for STE uncertainty)
+  draws_beta  <- rep(NA_real_, B)   # bootstrap Deming slope draws
   for (b in 1:B) {
     eS <- stats::rnorm(N, 0, sqrt(vS))
     eT <- stats::rnorm(sum(obsT), 0, sqrt(vT))
@@ -592,6 +596,13 @@ surro_nma_freq <- function(net, B = 400, boot = c("normal","student"), df = 5, s
     betaT_b <- try(solve(t(XT)%*%(W_T*XT), t(XT)%*%(W_T*yT_b)), silent=TRUE)
     if (inherits(betaT_b,"try-error")) betaT_b <- MASS::ginv(t(XT)%*%(W_T*XT)) %*% t(XT)%*%(W_T*yT_b)
     dT_b <- c(0, as.numeric(betaT_b))
+    # Per-replicate Deming surrogacy fit -> data-driven alpha/beta uncertainty for STE.
+    sX_b <- as.numeric(X %*% betaS_b)
+    sY_b <- as.numeric(XT %*% betaT_b)
+    if (sum(is.finite(sX_b[idx]) & is.finite(sY_b)) >= 3) {
+      ab_b <- deming(sX_b[idx], sY_b, ratio)
+      draws_alpha[b] <- ab_b["alpha"]; draws_beta[b] <- ab_b["beta"]
+    }
     dT_sur <- (ab["alpha"] + ab["beta"] * dS_b)
     draws_T[b, ] <- dT_sur
   }
@@ -601,6 +612,7 @@ surro_nma_freq <- function(net, B = 400, boot = c("normal","student"), df = 5, s
     net = net,
     dS = dS_hat, dT = dT_hat,
     deming = ab,
+    deming_draws = cbind(alpha = draws_alpha, beta = draws_beta),
     draws_T = draws_T,
     ranks = ranks,
     sucra = sucra(ranks),
@@ -679,12 +691,26 @@ surrogacy_diagnostics <- function(fit) {
     out$beta  = c(mean=mean(beta), q025=stats::quantile(beta,.025), q975=stats::quantile(beta,.975))
   } else {
     ab <- fit$deming
-    se_beta <- 0.2
-    draws_beta <- stats::rnorm(2000, ab["beta"], se_beta)
-    draws_alpha <- stats::rnorm(2000, ab["alpha"], 0.2)
-    out$STE <- compute_STE(draws_alpha, draws_beta, threshold_T=0)
-    out$alpha <- c(mean=ab["alpha"], q025=NA, q975=NA)
-    out$beta  <- c(mean=ab["beta"],  q025=NA, q975=NA)
+    dd <- fit$deming_draws
+    ok <- if (!is.null(dd)) is.finite(dd[,"alpha"]) & is.finite(dd[,"beta"]) else logical(0)
+    if (!is.null(dd) && sum(ok) >= 2) {
+      # Data-driven alpha/beta uncertainty from the bootstrap replicates (paired draws).
+      draws_alpha <- dd[ok, "alpha"]; draws_beta <- dd[ok, "beta"]
+      out$STE <- compute_STE(draws_alpha, draws_beta, threshold_T=0)
+      out$alpha <- c(mean=mean(draws_alpha),
+                     q025=unname(stats::quantile(draws_alpha,.025)),
+                     q975=unname(stats::quantile(draws_alpha,.975)))
+      out$beta  <- c(mean=mean(draws_beta),
+                     q025=unname(stats::quantile(draws_beta,.025)),
+                     q975=unname(stats::quantile(draws_beta,.975)))
+    } else {
+      # Bootstrap surrogacy draws unavailable (too few paired T rows): report point est only.
+      out$STE <- list(ste = NA_real_,
+                      summary = c(mean=NA, median=NA, `2.5%`=NA, `97.5%`=NA))
+      out$alpha <- c(mean=ab["alpha"], q025=NA, q975=NA)
+      out$beta  <- c(mean=ab["beta"],  q025=NA, q975=NA)
+      warning("Frequentist STE uncertainty unavailable (insufficient bootstrap surrogacy draws).")
+    }
   }
   class(out) <- "surro_diag"
   out
@@ -937,7 +963,7 @@ print(plot_surrogacy(fit))
 plot_networks(fit$net)
 ```",
 
-if (True) 
+if (TRUE)
 "## Posterior predictive check
 ```{r}
 if (fit$engine=='bayes') print(pp_check(fit))
@@ -1164,7 +1190,8 @@ simulate_surro_data <- function(K=5, J=20, per_study=1, alpha=0.0, beta=0.8, tau
   trts <- paste0("T", seq_len(K))
   n <- J*per_study
   A <- sample(trts, n, TRUE); B <- sample(trts, n, TRUE)
-  B[B==A] <- sample(trts[trts!=A[which(B==A)]], sum(B==A), TRUE)
+  coll <- which(B == A)                       # resample self-comparisons per-row
+  for (i in coll) B[i] <- sample(trts[trts != A[i]], 1)
   study <- rep(seq_len(J), each=per_study)
   dS <- c(0, stats::rnorm(K-1, 0, 0.3))
   dT <- c(0, stats::rnorm(K-1, 0, 0.3))
